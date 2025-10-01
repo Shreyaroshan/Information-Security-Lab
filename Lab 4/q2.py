@@ -5,12 +5,25 @@ import hashlib
 
 class RabinKeyManagement:
     def __init__(self, key_size=1024):
+        if key_size < 16 or key_size % 2 != 0:
+            raise ValueError("key_size should be an even integer >= 16")
         self.key_size = key_size
         self.keys = {}
 
+    def _get_prime_3mod4(self, bits):
+        """Return a prime p with p % 4 == 3"""
+        while True:
+            p = getPrime(bits)
+            if p % 4 == 3:
+                return p
+
     def generate_key_pair(self):
-        p = getPrime(self.key_size // 2)
-        q = getPrime(self.key_size // 2)
+        # Use primes p, q such that p % 4 == q % 4 == 3
+        half = self.key_size // 2
+        p = self._get_prime_3mod4(half)
+        q = self._get_prime_3mod4(half)
+        while p == q:
+            q = self._get_prime_3mod4(half)
         n = p * q
         public_key = (n,)
         private_key = (p, q)
@@ -18,36 +31,79 @@ class RabinKeyManagement:
 
     def encrypt(self, public_key, plaintext):
         n = public_key[0]
-        m = int.from_bytes(plaintext.encode(), byteorder='big')
-        ciphertext = pow(m, 2, n)
-        pt_hash = hashlib.sha256(plaintext.encode()).digest()
-        return (
-        base64.b64encode(ciphertext.to_bytes((ciphertext.bit_length() + 7) // 8, byteorder='big')).decode('utf-8'),
-        base64.b64encode(pt_hash).decode('utf-8'))
+        pt_bytes = plaintext.encode('utf-8')
+        m = int.from_bytes(pt_bytes, byteorder='big')
+        if m >= n:
+            raise ValueError("Plaintext too large for key size. Use larger key or shorter plaintext.")
+        ciphertext_int = pow(m, 2, n)
 
-    def decrypt(self, private_key, ciphertext, pt_hash):
+        # encode ciphertext and hash
+        c_bytes = ciphertext_int.to_bytes((ciphertext_int.bit_length() + 7) // 8 or 1, byteorder='big')
+        ct_b64 = base64.b64encode(c_bytes).decode('utf-8')
+        pt_hash_b64 = base64.b64encode(hashlib.sha256(pt_bytes).digest()).decode('utf-8')
+        return ct_b64, pt_hash_b64
+
+    def _crt_combine(self, a1, a2, n1, n2):
+        """
+        Combine x ≡ a1 (mod n1) and x ≡ a2 (mod n2)
+        using CRT. Returns x modulo n1*n2.
+        """
+        m1 = inverse(n1, n2)
+        # ensure the inner multiplication reduces mod n2 before multiplying by n1
+        t = ((a2 - a1) * m1) % n2
+        x = a1 + n1 * t
+        return x % (n1 * n2)
+
+    def decrypt(self, private_key, ciphertext_b64, pt_hash_b64):
         p, q = private_key
-        c = int.from_bytes(base64.b64decode(ciphertext), byteorder='big')
+        n = p * q
 
+        c_bytes = base64.b64decode(ciphertext_b64)
+        c = int.from_bytes(c_bytes, byteorder='big')
+
+        # compute square roots modulo p and q (works because p,q % 4 == 3)
         root_p1 = pow(c, (p + 1) // 4, p)
         root_p2 = (-root_p1) % p
         root_q1 = pow(c, (q + 1) // 4, q)
         root_q2 = (-root_q1) % q
 
-        def chinese_remainder_theorem(a1, a2, n1, n2):
-            m1 = inverse(n1, n2)
-            return (a1 + (a2 - a1) * m1 * n1) % (n1 * n2)
+        # combine to get the four square roots modulo n
+        roots = [
+            self._crt_combine(root_p1, root_q1, p, q),
+            self._crt_combine(root_p1, root_q2, p, q),
+            self._crt_combine(root_p2, root_q1, p, q),
+            self._crt_combine(root_p2, root_q2, p, q),
+        ]
 
-        root_1 = chinese_remainder_theorem(root_p1, root_q1, p, q)
-        root_2 = chinese_remainder_theorem(root_p1, root_q2, p, q)
-        root_3 = chinese_remainder_theorem(root_p2, root_q1, p, q)
-        root_4 = chinese_remainder_theorem(root_p2, root_q2, p, q)
+        expected_hash = base64.b64decode(pt_hash_b64)
 
-        plaintexts = [root_1, root_2, root_3, root_4]
-        for plaintext in plaintexts:
-            if hashlib.sha256(plaintext.to_bytes((plaintext.bit_length() + 7) // 8,
-                                                 byteorder='big')).digest() == base64.b64decode(pt_hash):
-                return plaintext.to_bytes((plaintext.bit_length() + 7) // 8, byteorder='big').decode('utf-8')
+        for r in roots:
+            # convert integer to bytes (use at least 1 byte if r == 0)
+            blen = (r.bit_length() + 7) // 8 or 1
+            candidate_bytes = r.to_bytes(blen, byteorder='big')
+
+            # some plaintexts may have leading zeros suppressed; try adjusting by padding to typical lengths
+            # but first check raw candidate
+            if hashlib.sha256(candidate_bytes).digest() == expected_hash:
+                try:
+                    return candidate_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    # Not valid UTF-8, continue searching
+                    continue
+
+            # try adding leading zero bytes up to a reasonable limit (in case original plaintext had leading zero bytes)
+            # length limit: key size bytes
+            max_pad = (n.bit_length() + 7) // 8
+            for pad in range(1, 5):  # small number of padding attempts (adjustable)
+                pad_bytes = b'\x00' * pad + candidate_bytes
+                if hashlib.sha256(pad_bytes).digest() == expected_hash:
+                    try:
+                        return pad_bytes.decode('utf-8')
+                    except UnicodeDecodeError:
+                        break
+
+        # if nothing matched
+        return None
 
     def store_key_pair(self, facility_id):
         public_key, private_key = self.generate_key_pair()
@@ -66,6 +122,8 @@ class RabinKeyManagement:
         if facility_id in self.keys:
             del self.keys[facility_id]
             print(f"Keys revoked for {facility_id}")
+        else:
+            print("No keys to revoke for", facility_id)
 
     def renew_keys(self):
         for facility_id in list(self.keys.keys()):
@@ -106,6 +164,7 @@ def menu():
                 message = input("Enter message to encrypt: ")
                 encrypted_message, message_hash = rkm.encrypt(key_pair['public_key'], message)
                 print(f"Encrypted message: {encrypted_message}")
+                print(f"Message SHA-256 (base64): {message_hash}")
                 decrypted_message = rkm.decrypt(key_pair['private_key'], encrypted_message, message_hash)
                 print(f"Decrypted message: {decrypted_message}")
         elif choice == '6':
